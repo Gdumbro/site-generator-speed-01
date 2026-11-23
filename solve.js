@@ -44,8 +44,8 @@ export function slugify(text) {
   if (ASCII_ONLY.test(text)) {
     // NFKD is the identity on ASCII and ASCII holds no combining marks, so
     // the reference's loop is exactly: lowercase, runs of non [a-z0-9] -> '-'.
-    out = text.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
-    out = out.slice(0, SLUG_MAX).replace(/-+$/, '');
+    out = dashTrim(text.toLowerCase().replace(/[^a-z0-9]+/g, '-'));
+    out = dashTrim(out.slice(0, SLUG_MAX));
   } else {
     const plain = text.normalize('NFKD').replace(/\p{M}/gu, '');
     let o = '';
@@ -62,11 +62,21 @@ export function slugify(text) {
       gap = false;
       o += keep;
     }
-    out = o.slice(0, SLUG_MAX).replace(/-+$/, '');
+    out = dashTrim(o.slice(0, SLUG_MAX));
   }
   if (out === '') out = 'untitled';
   slugCache.set(text, out);
   return out;
+}
+
+// Drop leading/trailing '-' of `s` (index scan, no regex): the slug rules
+// trim dashes before and after the 64-char cut.
+function dashTrim(s) {
+  let a = 0;
+  let b = s.length;
+  while (a < b && s[a] === '-') a++;
+  while (b > a && s[b - 1] === '-') b--;
+  return a === 0 && b === s.length ? s : s.slice(a, b);
 }
 
 function uniqueSlug(slug, taken) {
@@ -434,8 +444,6 @@ function renderMarkdown(src, env) {
   return { html: blocks.join(''), toc, excerpt: excerpt ?? '' };
 }
 
-// ---------------------------------------------------------------- templates
-
 /** The deepest an include nests: one past it renders nothing. */
 const INCLUDE_DEPTH = 8;
 
@@ -535,12 +543,14 @@ function parseTemplate(name, src) {
   return root.body;
 }
 
-/** The value at `path` in the scope chain: first name from the nearest scope holding it. */
+/** The value at `path` in the scope chain: first name from the nearest scope holding it.
+ * Scopes are null-prototype objects whose prototype IS the parent scope, so
+ * the first segment resolves with one native prototype-chain lookup. Nested
+ * segments keep the hasOwn walk (a plain object's inherited names, e.g.
+ * `constructor`, must not resolve — the reference's lookup does not see them). */
 function lookup(scope, path) {
-  let s = scope;
-  while (s !== null && !Object.hasOwn(s.vars, path[0])) s = s.parent;
-  if (s === null) return undefined;
-  let v = s.vars[path[0]];
+  let v = scope[path[0]];
+  if (v === undefined) return undefined;
   for (let k = 1; k < path.length; k++) {
     if (v === null || typeof v !== 'object' || !Object.hasOwn(v, path[k])) return undefined;
     v = v[path[k]];
@@ -569,6 +579,10 @@ const R = {
   text: textOf,
   truthy,
   lookup,
+  // Fused var/raw rendering: one call per template variable instead of
+  // lookup + textOf + escapeHtml (three calls with the same path array).
+  v(sc, path) { return escapeHtml(textOf(lookup(sc, path))); },
+  r(sc, path) { return textOf(lookup(sc, path)); },
   inc(C, name, sc, depth) {
     if (depth >= INCLUDE_DEPTH) return '';
     const f = C.get(name);
@@ -576,11 +590,15 @@ const R = {
     // Case-constant templates (output depends only on site/tags/recent and
     // the depth) are rendered once per (name, depth) within a case.
     if (C._cf !== undefined && C._cf.get(name) === true) {
-      const key = `${name}\n${depth}`;
-      const hit = C._cc.get(key);
+      let byDepth = C._cc.get(name);
+      if (byDepth === undefined) {
+        byDepth = new Map();
+        C._cc.set(name, byDepth);
+      }
+      const hit = byDepth.get(depth);
       if (hit !== undefined) return hit;
       const out = f(sc, depth + 1, C);
-      C._cc.set(key, out);
+      byDepth.set(depth, out);
       return out;
     }
     return f(sc, depth + 1, C);
@@ -635,14 +653,24 @@ function constOf(name, parsed, memo, seen) {
  */
 function compileTemplate(nodes) {
   let uid = 0;
+  const paths = new Map();
+  const pathId = (p) => {
+    const k = JSON.stringify(p);
+    let id = paths.get(k);
+    if (id === undefined) {
+      id = paths.size;
+      paths.set(k, id);
+    }
+    return `P${id}`;
+  };
   const gen = (list, sv) => {
     let c = '';
     for (const node of list) {
       if (node.kind === 'text') c += `o+=${JSON.stringify(node.text)};`;
-      else if (node.kind === 'var') c += `o+=R.esc(R.text(R.lookup(${sv},${JSON.stringify(node.path)})));`;
-      else if (node.kind === 'raw') c += `o+=R.text(R.lookup(${sv},${JSON.stringify(node.path)}));`;
+      else if (node.kind === 'var') c += `o+=R.v(${sv},${pathId(node.path)});`;
+      else if (node.kind === 'raw') c += `o+=R.r(${sv},${pathId(node.path)});`;
       else if (node.kind === 'if') {
-        const cond = `R.truthy(R.lookup(${sv},${JSON.stringify(node.path)}))`;
+        const cond = `R.truthy(R.lookup(${sv},${pathId(node.path)}))`;
         c += `if(${node.not ? '!' : ''}${cond}){${gen(node.then, sv)}}`;
         if (node.else !== null) c += `else{${gen(node.else, sv)}}`;
       } else if (node.kind === 'for') {
@@ -650,33 +678,38 @@ function compileTemplate(nodes) {
         const sv2 = `s${uid++}`;
         const lp = `l${uid++}`;
         // One scope + one loop object per loop (not per item): mutated per
-        // iteration. The loop var is assigned before .loop so that a var
-        // named "loop" still loses to the loop object, as in the reference.
-        c += `{const xs=R.lookup(${sv},${JSON.stringify(node.path)});if(Array.isArray(xs)){const ${sv2}={vars:{},parent:${sv}};const ${lp}={index:0,first:false,last:false,length:xs.length};for(let ${k}=0;${k}<xs.length;${k}++){${sv2}.vars[${JSON.stringify(node.name)}]=xs[${k}];${sv2}.vars.loop=${lp};${lp}.index=${k}+1;${lp}.first=${k}===0;${lp}.last=${k}===xs.length-1;${gen(node.body, sv2)}}}}`;
+        // iteration. The scope is Object.create(parent), so the loop var and
+        // `loop` are own properties shadowing the parent's. The loop var is
+        // assigned before .loop so that a var named "loop" still loses to
+        // the loop object, as in the reference.
+        c += `{const xs=R.lookup(${sv},${pathId(node.path)});if(Array.isArray(xs)){const ${sv2}=Object.create(${sv});const ${lp}={index:0,first:false,last:false,length:xs.length};for(let ${k}=0;${k}<xs.length;${k}++){${sv2}[${JSON.stringify(node.name)}]=xs[${k}];${sv2}.loop=${lp};${lp}.index=${k}+1;${lp}.first=${k}===0;${lp}.last=${k}===xs.length-1;${gen(node.body, sv2)}}}}`;
       } else if (node.kind === 'include') {
         c += `o+=R.inc(C,${JSON.stringify(node.name)},${sv},depth);`;
       }
     }
     return c;
   };
-  const factory = new Function('R', `return function(sc,depth,C){let o='';${gen(nodes, 'sc')}return o;}`);
+  const body = gen(nodes, 'sc');
+  let decls = '';
+  for (const [k, id] of paths) decls += `const P${id}=${k};`;
+  const factory = new Function('R', `return function(sc,depth,C){let o='';${decls}${body}return o;}`);
   return factory(R);
 }
 
 // ---------------------------------------------------------------- build
 
 // Count runs of non-whitespace (exactly /\S+/g's \s set) without allocating
-// the match array: reading_minutes only needs the count.
+// the match array: reading_minutes only needs the count. The whitespace test
+// is a table lookup (one array access per char) instead of a chain of
+// comparisons — the chain was ~11% of warm run() time.
+const WS_TABLE = new Uint8Array(0x10000);
+for (const c of [9, 10, 11, 12, 13, 32, 0x00a0, 0x1680, 0x2028, 0x2029, 0x202f, 0x205f, 0x3000, 0xfeff]) WS_TABLE[c] = 1;
+for (let c = 0x2000; c <= 0x200a; c++) WS_TABLE[c] = 1;
 function wordsOf(text) {
   let n = 0;
   let inWord = false;
   for (let i = 0; i < text.length; i++) {
-    const c = text.charCodeAt(i);
-    const ws = c === 32 || c === 9 || c === 10 || c === 13 || c === 12 || c === 11
-      || c === 0x00a0 || c === 0x1680 || (c >= 0x2000 && c <= 0x200a)
-      || c === 0x2028 || c === 0x2029 || c === 0x202f || c === 0x205f
-      || c === 0x3000 || c === 0xfeff;
-    if (ws) inWord = false;
+    if (WS_TABLE[text.charCodeAt(i)] === 1) inWord = false;
     else if (!inWord) { n++; inWord = true; }
   }
   return n;
@@ -893,10 +926,20 @@ export function run(input) {
   const site = { title: input.site.title, base_url: base };
   const allTags = tags.map((t) => ({ name: t.name, slug: t.slug, url: t.url, count: t.posts.length }));
   const recent = posts.slice(0, input.site.recent).map((p) => cards.get(p));
+  // One root scope per case (null-prototype, holds site/tags/recent); each
+  // render gets a child scope whose own properties are the render's vars —
+  // no object spread per render, and lookup walks the prototype chain.
+  const rootScope = Object.create(null);
+  rootScope.site = site;
+  rootScope.tags = allTags;
+  rootScope.recent = recent;
   const output = {};
   const render = (name, vars) => {
     const fn = templates.get(name);
-    return fn === undefined ? null : fn({ vars: { site, tags: allTags, recent, ...vars }, parent: null }, 0, templates);
+    if (fn === undefined) return null;
+    const sc = Object.create(rootScope);
+    Object.assign(sc, vars);
+    return fn(sc, 0, templates);
   };
   for (const s of kept) output[`${s.outDir}/index.html`] = render(s.layout, { page: pageOf(s) });
   const per = input.site.per_page;
@@ -927,3 +970,4 @@ export function run(input) {
   output['build-report.txt'] = `${lines.join('\n')}\n`;
   return output;
 }
+
