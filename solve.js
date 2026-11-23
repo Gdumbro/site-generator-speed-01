@@ -567,34 +567,75 @@ function textOf(v) {
   return '';
 }
 
-/** Whether a value counts as true in an if. */
-function truthy(v) {
-  if (Array.isArray(v)) return v.length > 0;
-  return v !== undefined && v !== null && v !== false && v !== '' && v !== 0;
-}
-
 /** Runtime helpers the compiled templates call. */
 const R = {
-  esc: escapeHtml,
-  text: textOf,
-  truthy,
   lookup,
-  // Fused var/raw rendering: one call per template variable instead of
-  // lookup + textOf + escapeHtml (three calls with the same path array).
-  v(sc, path) { return escapeHtml(textOf(lookup(sc, path))); },
-  r(sc, path) { return textOf(lookup(sc, path)); },
-  inc(C, name, sc, depth) {
+  // Fused var/raw rendering: lookup + textOf (+ escapeHtml) in one call.
+  // Numbers/booleans hold no escapables, so their escapeHtml is skipped.
+  v(sc, path) {
+    let v = sc[path[0]];
+    if (v === undefined) return '';
+    for (let k = 1; k < path.length; k++) {
+      if (v === null || typeof v !== 'object' || !Object.hasOwn(v, path[k])) return '';
+      v = v[path[k]];
+    }
+    const t = typeof v;
+    if (t === 'string') return escapeHtml(v);
+    if (t === 'number' || t === 'boolean') return String(v);
+    if (Array.isArray(v)) return escapeHtml(v.map(textOf).join(', '));
+    return '';
+  },
+  r(sc, path) {
+    let v = sc[path[0]];
+    if (v === undefined) return '';
+    for (let k = 1; k < path.length; k++) {
+      if (v === null || typeof v !== 'object' || !Object.hasOwn(v, path[k])) return '';
+      v = v[path[k]];
+    }
+    const t = typeof v;
+    if (t === 'string') return v;
+    if (t === 'number' || t === 'boolean') return String(v);
+    if (Array.isArray(v)) return v.map(textOf).join(', ');
+    return '';
+  },
+  // Fused if-condition: truthy(lookup(...)) in one call.
+  t(sc, path) {
+    let v = sc[path[0]];
+    if (v === undefined) return false;
+    for (let k = 1; k < path.length; k++) {
+      if (v === null || typeof v !== 'object' || !Object.hasOwn(v, path[k])) return false;
+      v = v[path[k]];
+    }
+    if (Array.isArray(v)) return v.length > 0;
+    return v !== undefined && v !== null && v !== false && v !== '' && v !== 0;
+  },
+  // Include: the per-template entry lives on the function object itself
+  // (one Map get instead of four): f._cf is the case-constant flag,
+  // f._cc its per-depth constant cache, f._km its per-item memo.
+  // `key` is the free-root object when the included template depends on
+  // exactly one non-case root (passed by the compiled code); otherwise
+  // undefined and the constant/plain paths run as before.
+  inc(C, name, sc, depth, key) {
     if (depth >= INCLUDE_DEPTH) return '';
     const f = C.get(name);
     if (f === undefined) return '';
-    // Case-constant templates (output depends only on site/tags/recent and
-    // the depth) are rendered once per (name, depth) within a case.
-    if (C._cf !== undefined && C._cf.get(name) === true) {
-      let byDepth = C._cc.get(name);
+    if (key !== undefined && typeof key === 'object' && key !== null) {
+      let km = f._km;
+      if (km === undefined) km = f._km = new WeakMap();
+      let byDepth = km.get(key);
       if (byDepth === undefined) {
         byDepth = new Map();
-        C._cc.set(name, byDepth);
+        km.set(key, byDepth);
       }
+      const hit = byDepth.get(depth);
+      if (hit !== undefined) return hit;
+      const out = f(sc, depth + 1, C);
+      byDepth.set(depth, out);
+      return out;
+    }
+    if (f._cf === true) {
+      let byDepth = f._cc;
+      if (byDepth === undefined) byDepth = f._cc = new Map();
       const hit = byDepth.get(depth);
       if (hit !== undefined) return hit;
       const out = f(sc, depth + 1, C);
@@ -645,13 +686,52 @@ function constOf(name, parsed, memo, seen) {
   return ok;
 }
 
+/** First segments a template's output depends on, besides case-level roots
+ * and names bound by its own fors (transitively through includes). Used for
+ * the per-item memo: exactly one such root, and it is not `loop` (the loop
+ * object is mutated per iteration, so it can never be a memo key). A missing
+ * template renders '' (no roots); a cycle back-edge adds nothing (the cycle
+ * target's own refs are collected on its first visit, and the walk is a
+ * union over every reachable node's own refs). */
+function freeRoots(nodes, bound, parsed, seen) {
+  const out = new Set();
+  for (const node of nodes) {
+    if (node.kind === 'text') continue;
+    if (node.kind === 'var' || node.kind === 'raw') {
+      if (!CASE_ROOTS.has(node.path[0]) && !bound.has(node.path[0])) out.add(node.path[0]);
+    } else if (node.kind === 'if') {
+      if (!CASE_ROOTS.has(node.path[0]) && !bound.has(node.path[0])) out.add(node.path[0]);
+      for (const r of freeRoots(node.then, bound, parsed, seen)) out.add(r);
+      if (node.else !== null) for (const r of freeRoots(node.else, bound, parsed, seen)) out.add(r);
+    } else if (node.kind === 'for') {
+      if (!CASE_ROOTS.has(node.path[0]) && !bound.has(node.path[0])) out.add(node.path[0]);
+      const b2 = new Set(bound);
+      b2.add(node.name);
+      b2.add('loop');
+      for (const r of freeRoots(node.body, b2, parsed, seen)) out.add(r);
+    } else if (node.kind === 'include') {
+      if (parsed.has(node.name) && !seen.has(node.name)) {
+        seen.add(node.name);
+        for (const r of freeRoots(parsed.get(node.name), bound, parsed, seen)) out.add(r);
+        seen.delete(node.name);
+      }
+    }
+  }
+  return out;
+}
+
+function freeRootsOf(name, parsed) {
+  if (!parsed.has(name)) return new Set();
+  return freeRoots(parsed.get(name), new Set(), parsed, new Set([name]));
+}
+
 /**
  * A parsed template compiled to a render function (sc, depth, C) -> string.
  * Template source is embedded only through JSON.stringify, so no template
  * text can escape its string literal. The generated code is straight-line
  * JS: text pushes, lookups, real if/for control flow, include calls.
  */
-function compileTemplate(nodes) {
+function compileTemplate(nodes, memoRoots) {
   let uid = 0;
   const paths = new Map();
   const pathId = (p) => {
@@ -670,7 +750,7 @@ function compileTemplate(nodes) {
       else if (node.kind === 'var') c += `o+=R.v(${sv},${pathId(node.path)});`;
       else if (node.kind === 'raw') c += `o+=R.r(${sv},${pathId(node.path)});`;
       else if (node.kind === 'if') {
-        const cond = `R.truthy(R.lookup(${sv},${pathId(node.path)}))`;
+        const cond = `R.t(${sv},${pathId(node.path)})`;
         c += `if(${node.not ? '!' : ''}${cond}){${gen(node.then, sv)}}`;
         if (node.else !== null) c += `else{${gen(node.else, sv)}}`;
       } else if (node.kind === 'for') {
@@ -684,7 +764,14 @@ function compileTemplate(nodes) {
         // the loop object, as in the reference.
         c += `{const xs=R.lookup(${sv},${pathId(node.path)});if(Array.isArray(xs)){const ${sv2}=Object.create(${sv});const ${lp}={index:0,first:false,last:false,length:xs.length};for(let ${k}=0;${k}<xs.length;${k}++){${sv2}[${JSON.stringify(node.name)}]=xs[${k}];${sv2}.loop=${lp};${lp}.index=${k}+1;${lp}.first=${k}===0;${lp}.last=${k}===xs.length-1;${gen(node.body, sv2)}}}}`;
       } else if (node.kind === 'include') {
-        c += `o+=R.inc(C,${JSON.stringify(node.name)},${sv},depth);`;
+        // A single-free-root include passes its root object as the memo key;
+        // the key is what the template would see through the scope chain, so
+        // a non-object/undefined key (root not in scope here) falls back to
+        // the plain include inside R.inc.
+        const root = memoRoots.get(node.name);
+        c += root === null || root === undefined
+          ? `o+=R.inc(C,${JSON.stringify(node.name)},${sv},depth);`
+          : `o+=R.inc(C,${JSON.stringify(node.name)},${sv},depth,${sv}.${root});`;
       }
     }
     return c;
@@ -785,10 +872,19 @@ export function run(input) {
     }
   }
   const templates = new Map();
-  for (const [name, nodes] of parsed) templates.set(name, compileTemplate(nodes));
   const constMemo = new Map();
-  templates._cf = new Map([...parsed.keys()].map((n) => [n, constOf(n, parsed, constMemo, new Set())]));
-  templates._cc = new Map();
+  // Per-template memo root: the single non-case root a template's output
+  // depends on (null when there is none, several, or it is `loop`).
+  const memoRoots = new Map();
+  for (const name of parsed.keys()) {
+    const roots = freeRootsOf(name, parsed);
+    memoRoots.set(name, roots.size === 1 && !roots.has('loop') ? [...roots][0] : null);
+  }
+  for (const [name, nodes] of parsed) {
+    const fn = compileTemplate(nodes, memoRoots);
+    fn._cf = constOf(name, parsed, constMemo, new Set());
+    templates.set(name, fn);
+  }
   const base = input.site.base_url.replace(/\/+$/, '');
   const files = [...input.files].sort((x, y) => byCodeUnits(x.path, y.path));
   const sources = [];
